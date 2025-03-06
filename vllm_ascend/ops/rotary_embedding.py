@@ -88,5 +88,6 @@ def rope_deepseek_forward_oot(
     return query, key
 
 
-RotaryEmbedding.forward_oot = rope_forward_oot
-DeepseekScalingRotaryEmbedding.forward = rope_deepseek_forward_oot
+# TODO: Patch when aclnn ops avaiable
+# RotaryEmbedding.forward_oot = rope_forward_oot
+# DeepseekScalingRotaryEmbedding.forward = rope_deepseek_forward_oot
