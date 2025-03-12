@@ -26,6 +26,8 @@ try:
 except ImportError:
     print("Failed to import torch_npu.")
 
+import torchair._contrib.custom_torch_ops
+
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer,
                                               AttentionMetadata, AttentionType,
@@ -683,14 +685,64 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         self.q_proj = extra_impl_args['q_proj']
         self.kv_b_proj = extra_impl_args['kv_b_proj']
         self.o_proj = extra_impl_args['o_proj']
+        self.kv_a_proj_with_mqa = extra_impl_args.get('kv_a_proj_with_mqa', None)
+        self.kv_a_layernorm = extra_impl_args.get('kv_a_layernorm', None)
         self.w_kc = None
         self.w_vc = None
+
+    def exec_kv(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slots: torch.Tensor,
+    ):
+        kv = self.kv_a_proj_with_mqa(hidden_states)[0]
+        kv = kv.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+        k_nope_cache = kv_cache[0][..., :self.kv_lora_rank]
+        k_pe_cache = kv_cache[0][..., self.kv_lora_rank:]
+        k_pe, k_nope = torch.ops.npu_inference.npu_kv_rmsnorm_rope_cache(
+            kv, self.kv_a_layernorm.weight, 
+            cos, sin, slots, 
+            k_nope_cache, k_pe_cache,
+            epsilon=self.kv_a_layernorm.variance_epsilon)
+        return k_pe, k_nope
+
+    def apply_rotary_emb(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        is_neox_style: bool,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [num_tokens, num_heads, head_size]
+            cos: [num_tokens, head_size // 2]
+            sin: [num_tokens, head_size // 2]
+            is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+                positional embeddings.
+        """
+        cos = cos.unsqueeze(-2).to(x.dtype)
+        sin = sin.unsqueeze(-2).to(x.dtype)
+        if is_neox_style:
+            x1, x2 = torch.chunk(x, 2, dim=-1)
+        else:
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        if is_neox_style:
+            return torch.cat((o1, o2), dim=-1)
+        else:
+            return torch.stack((o1, o2), dim=-1).flatten(-2)
 
     def forward(
         self,
         layer: AttentionLayer,
         hidden_states_or_q_c: torch.Tensor,
-        kv_c_normed: torch.Tensor,
+        hidden_states_or_kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AscendMetadata,
@@ -701,7 +753,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         Args:
             hidden_states_or_q_c: shape = [num_tokens, num_heads * head_size]
                                            num_tokens = batch_size * seq_len
-            kv_c_normed: shape = [num_tokens, num_kv_heads * head_size]
+            hidden_states_or_kv_c_normed: shape = [num_tokens, num_kv_heads * head_size]
             k_pe: shape = [num_tokens, num_kv_heads * head_size]
             kv_cache: shape = [1, num_blocks, block_size,
                                num_kv_heads * head_size]
@@ -722,19 +774,41 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                                                       self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
                                dim=-1)
-        k_pe = k_pe.view(num_tokens, self.num_kv_heads, -1)
-
-        if self.rotary_emb.__class__.__name__ == 'RotaryEmbedding':
-            ori_q_pe_shape, ori_k_pe_shape = q_pe.shape, k_pe.shape
-            q_pe = q_pe.reshape(num_tokens, -1)
-            k_pe = k_pe.reshape(num_tokens, -1)
-            q_pe, k_pe = self.rotary_emb(attn_metadata.input_positions, q_pe,
-                                         k_pe)
-            q_pe = q_pe.view(ori_q_pe_shape)
-            k_pe = k_pe.view(ori_k_pe_shape)
+        if k_pe == None and attn_metadata.decode_metadata:
+            cos_sin = self.rotary_emb.cos_sin_cache[attn_metadata.input_positions]
+            if self.rotary_emb.cos_sin_cache.device != q_pe.device:
+                cos_sin = cos_sin.to(q_pe.device)
+            if self.rotary_emb.cos_sin_cache.dtype != q_pe.dtype:
+                cos_sin = cos_sin.to(q_pe.dtype)
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            # npu_interleave_rope need BNSD and seq_len is 1 in decode stage.
+            # q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
+            # cos = cos.view(num_tokens, 1, 1, -1)
+            # sin = sin.view(num_tokens, 1, 1, -1)
+            # q_pe = torch.ops.npu_inference.npu_interleave_rope(q_pe, cos, sin)
+            # q_pe = q_pe.view(num_tokens, self.num_heads, -1)
+            q_pe = self.apply_rotary_emb(q_pe, cos, sin, self.rotary_emb.is_neox_style)
+            kv = self.kv_a_proj_with_mqa(hidden_states_or_kv_c_normed)[0]
+            k_pe, k_nope = self.exec_kv(hidden_states_or_kv_c_normed, cos, sin, kv_cache, attn_metadata.slot_mapping)
         else:
-            q_pe, k_pe = self.rotary_emb(attn_metadata.input_positions, q_pe,
-                                         k_pe)
+            if k_pe == None:
+                kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states_or_kv_c_normed)[0].split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+            else:
+                kv_c_normed = hidden_states_or_kv_c_normed
+            k_pe = k_pe.view(num_tokens, self.num_kv_heads, -1)
+            if self.rotary_emb.__class__.__name__ == 'RotaryEmbedding':
+                ori_q_pe_shape, ori_k_pe_shape = q_pe.shape, k_pe.shape
+                q_pe = q_pe.reshape(num_tokens, -1)
+                k_pe = k_pe.reshape(num_tokens, -1)
+                q_pe, k_pe = self.rotary_emb(attn_metadata.input_positions, q_pe,
+                                            k_pe)
+                q_pe = q_pe.view(ori_q_pe_shape)
+                k_pe = k_pe.view(ori_k_pe_shape)
+            else:
+                q_pe, k_pe = self.rotary_emb(attn_metadata.input_positions, q_pe,
+                                             k_pe)
 
         if self.w_kc is None or self.w_vc is None:
             kv_b_proj_weight = self.kv_b_proj.weight.reshape(
@@ -759,36 +833,26 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         query = torch.cat([q_nope, q_pe], dim=-1).view(num_tokens,
                                                        self.num_heads, -1)
 
-        if kv_cache.numel() > 0:
+        if kv_cache.numel() > 0 and (VLLM_ENABLE_GRAPH_MODE != '1' or attn_metadata.num_prefills > 0):
             key_cache = kv_cache[0]
             num_blocks, block_size, _ = key_cache.shape
             key = torch.cat(
                 [kv_c_normed.view(num_tokens, self.num_kv_heads, -1), k_pe],
                 dim=2)
             slots = attn_metadata.slot_mapping
-            if VLLM_ENABLE_GRAPH_MODE == '1':
-                key_cache = key_cache.view(
-                    num_blocks * block_size, self.num_kv_heads,
-                    self.qk_rope_head_dim + self.kv_lora_rank)
-                torch_npu.npu_scatter_nd_update_(key_cache, slots.view(-1, 1), key)
-                # TODO: Check if key_cache need to rehape
-                key_cache = key_cache.view(
-                    num_blocks, block_size, self.num_kv_heads,
-                    self.qk_rope_head_dim + self.kv_lora_rank)
-            else:
-                key_cache = key_cache.view(
-                    num_blocks, block_size, self.num_kv_heads,
-                    self.qk_rope_head_dim + self.kv_lora_rank)
-                torch_npu._npu_reshape_and_cache_siso(key=key,
-                                                      key_cache=key_cache,
-                                                      slot_indices=slots)
+            key_cache = key_cache.view(
+                num_blocks, block_size, self.num_kv_heads,
+                self.qk_rope_head_dim + self.kv_lora_rank)
+            torch_npu._npu_reshape_and_cache_siso(key=key,
+                                                  key_cache=key_cache,
+                                                  slot_indices=slots)
 
         if attn_metadata.num_prefills > 0:
             attn_output = torch.empty(num_tokens,
-                                    self.num_heads,
-                                    self.v_head_dim,
-                                    dtype=query.dtype,
-                                    device="npu")
+                                      self.num_heads,
+                                      self.v_head_dim,
+                                      dtype=query.dtype,
+                                      device="npu")
             if (attn_metadata.block_tables is None
                     or attn_metadata.block_tables.numel() == 0):
                 assert attn_metadata.attn_mask is not None
@@ -819,9 +883,9 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         elif attn_metadata.decode_metadata:
             assert kv_cache is not None
             if VLLM_ENABLE_GRAPH_MODE == '1':
-                k_nope = key_cache[..., :self.kv_lora_rank]
-                k_pe = key_cache[..., self.kv_lora_rank:]
-                v = key_cache[..., :self.kv_lora_rank]
+                k_nope = kv_cache[0][..., :self.kv_lora_rank]
+                k_pe = kv_cache[0][..., self.kv_lora_rank:]
+                v = k_nope
                 # TorchAir's shape is [bs, num_heads_per_rank, seq_len, dim]
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1)
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
