@@ -687,6 +687,8 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         self.o_proj = extra_impl_args['o_proj']
         self.kv_a_proj_with_mqa = extra_impl_args.get('kv_a_proj_with_mqa', None)
         self.kv_a_layernorm = extra_impl_args.get('kv_a_layernorm', None)
+        self.k_pe_cache = None
+        self.k_nope_cache = None
         self.w_kc = None
         self.w_vc = None
 
@@ -695,17 +697,14 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: torch.Tensor,
         slots: torch.Tensor,
     ):
         kv = self.kv_a_proj_with_mqa(hidden_states)[0]
         kv = kv.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
-        k_nope_cache = kv_cache[0][..., :self.kv_lora_rank]
-        k_pe_cache = kv_cache[0][..., self.kv_lora_rank:]
         k_pe, k_nope = torch.ops.npu_inference.npu_kv_rmsnorm_rope_cache(
             kv, self.kv_a_layernorm.weight, 
             cos, sin, slots, 
-            k_nope_cache, k_pe_cache,
+            self.k_nope_cache, self.k_pe_cache,
             epsilon=self.kv_a_layernorm.variance_epsilon)
         return k_pe, k_nope
 
@@ -788,8 +787,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
             # q_pe = torch.ops.npu_inference.npu_interleave_rope(q_pe, cos, sin)
             # q_pe = q_pe.view(num_tokens, self.num_heads, -1)
             q_pe = self.apply_rotary_emb(q_pe, cos, sin, self.rotary_emb.is_neox_style)
-            kv = self.kv_a_proj_with_mqa(hidden_states_or_kv_c_normed)[0]
-            k_pe, k_nope = self.exec_kv(hidden_states_or_kv_c_normed, cos, sin, kv_cache, attn_metadata.slot_mapping)
+            k_pe, k_nope = self.exec_kv(hidden_states_or_kv_c_normed, cos, sin, attn_metadata.slot_mapping)
         else:
             if k_pe == None:
                 kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states_or_kv_c_normed)[0].split(
@@ -846,6 +844,9 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
             torch_npu._npu_reshape_and_cache_siso(key=key,
                                                   key_cache=key_cache,
                                                   slot_indices=slots)
+            if self.k_nope_cache is None:
+                self.k_nope_cache = kv_cache[..., :self.kv_lora_rank]
+                self.k_pe_cache = kv_cache[..., self.kv_lora_rank:]
 
         if attn_metadata.num_prefills > 0:
             attn_output = torch.empty(num_tokens,
@@ -883,20 +884,17 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         elif attn_metadata.decode_metadata:
             assert kv_cache is not None
             if VLLM_ENABLE_GRAPH_MODE == '1':
-                k_nope = kv_cache[0][..., :self.kv_lora_rank]
-                k_pe = kv_cache[0][..., self.kv_lora_rank:]
-                v = k_nope
                 # TorchAir's shape is [bs, num_heads_per_rank, seq_len, dim]
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1)
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q_nope, k_nope, v, query_rope=q_pe, key_rope=k_pe,
+                    q_nope, self.k_nope_cache, self.k_nope_cache, query_rope=q_pe, key_rope=self.k_pe_cache,
                     num_heads=self.num_heads,
                     num_key_value_heads=1, input_layout="BNSD",
                     atten_mask=attn_metadata.attn_mask, scale=self.scale,
                     antiquant_mode=0, antiquant_scale=None,
                     block_table=attn_metadata.block_tables,
-                    block_size=k_nope.shape[1],
+                    block_size=self.k_pe_cache.shape[1],
                     actual_seq_lengths_kv=attn_metadata.seq_lens,
                 )
                 attn_output = attn_output.view(num_tokens, -1, self.kv_lora_rank).transpose(0, 1)
