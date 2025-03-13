@@ -266,10 +266,12 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                                 eps=config.rms_norm_eps)
 
 
-class CustomDeepseekV2Model(DeepseekV2Model):
+class CustomDeepseekV2Model(nn.Module):
+
+    fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        nn.Module.__init__(self)
+        super().__init__()
 
         config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
@@ -306,6 +308,44 @@ class CustomDeepseekV2Model(DeepseekV2Model):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors],
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states, residual = layer(positions, hidden_states,
+                                            kv_caches[i - self.start_layer],
+                                            attn_metadata, residual)
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
