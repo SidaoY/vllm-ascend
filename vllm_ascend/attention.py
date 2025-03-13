@@ -179,7 +179,7 @@ class AscendMLAAttentionBackend(AscendAttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        return (1, num_blocks, block_size, num_kv_heads * head_size)
+        return (num_blocks, block_size, num_kv_heads, head_size)
 
 
 @dataclass
@@ -832,17 +832,12 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                                                        self.num_heads, -1)
 
         if kv_cache.numel() > 0 and (VLLM_ENABLE_GRAPH_MODE != '1' or attn_metadata.num_prefills > 0):
-            key_cache = kv_cache[0]
-            num_blocks, block_size, _ = key_cache.shape
             key = torch.cat(
                 [kv_c_normed.view(num_tokens, self.num_kv_heads, -1), k_pe],
                 dim=2)
             slots = attn_metadata.slot_mapping
-            key_cache = key_cache.view(
-                num_blocks, block_size, self.num_kv_heads,
-                self.qk_rope_head_dim + self.kv_lora_rank)
             torch_npu._npu_reshape_and_cache_siso(key=key,
-                                                  key_cache=key_cache,
+                                                  key_cache=kv_cache,
                                                   slot_indices=slots)
             if self.k_nope_cache is None:
                 self.k_nope_cache = kv_cache[..., :self.kv_lora_rank]
