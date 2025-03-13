@@ -906,7 +906,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 block_tables = attn_metadata.decode_metadata.block_tables
                 torch_npu._npu_paged_attention_mla(
                     query=query,
-                    key_cache=key_cache,
+                    key_cache=kv_cache,
                     num_kv_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
                     scale_value=self.scale,
