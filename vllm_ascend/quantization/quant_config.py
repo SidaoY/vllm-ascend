@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Callable
 
 import torch
 import torch_npu  # noqa: F401
@@ -30,9 +30,11 @@ from vllm.model_executor.layers.quantization import \
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.parameter import (BasevLLMParameter,
-                                           ChannelQuantScaleParameter,
-                                           ModelWeightParameter)
+from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase)
+from vllm.model_executor.parameter import (ChannelQuantScaleParameter,
+                                           ModelWeightParameter,
+                                           PerTensorScaleParameter)
+from vllm.model_executor.utils import set_weight_attrs
 
 from .quantizer import AscendQuantizer
 
@@ -41,10 +43,17 @@ logger = init_logger(__name__)
 
 @register_quantization_config("ascend")
 class AscendQuantConfig(QuantizationConfig):
-    """Config class for Ascend"""
+    """Config class for Ascend
+    
+    This class is a general class that parse quantization configs
+    that are supported on ascend hardware.
+    """
 
     def __init__(self, quant_config: Dict[str, Any]):
         self.quant_description = quant_config
+        self.packed_modules_mapping = {
+            "gate_up_proj": ["gate_proj", "up_proj"]
+        }
 
     def __repr__(self) -> str:
         return "AscendQuantConfig:\n" + super().__repr__()
@@ -84,10 +93,12 @@ class AscendQuantConfig(QuantizationConfig):
             if self.is_layer_skipped_ascend(prefix,
                                             self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
-            return AscendLinearMethod(self)
-        if isinstance(layer, Attention) and \
+            return AscendLinearMethod(self, prefix)
+        elif isinstance(layer, Attention) and \
             'fa_quant_type' in self.quant_description.keys():
-            return AscendQKVQuantAttentionMethod(self)
+            return AscendKVCacheMethod(self, prefix)
+        elif isinstance(layer, FusedMoE):
+            return AscendFusedMoEMethod(self, prefix)
         return None
 
     def is_layer_skipped_ascend(
@@ -127,13 +138,16 @@ class AscendQuantConfig(QuantizationConfig):
 class AscendLinearMethod(LinearMethodBase):
     """Linear method for Ascend quantization.
 
+    This class calls AscendQuantizer to search a specific quantization
+    implementations supported on ascend hardware for linear methods.
+
     Args:
         quant_config: The Ascend quantization config.
     """
 
-    def __init__(self, quant_config: AscendQuantConfig) -> None:
+    def __init__(self, quant_config: AscendQuantConfig, prefix: str) -> None:
         self.quantizer = AscendQuantizer.get_quantizer(
-            quant_config.quant_description)
+            quant_config.quant_description, prefix)
         self.quant_method = self.quantizer.build_linear_method()
 
     def create_weights(
@@ -146,57 +160,40 @@ class AscendLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del output_size
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        weights = self.quant_method.create_weights(input_size_per_partition,
+        weight_dict = self.quant_method.get_weight(input_size_per_partition,
                                                    output_size_per_partition,
                                                    params_dtype)
-
-        weight_name = self.quant_method.get_weight()
-        if weight_name in weights.keys():
+        for weight_name, weight_param in weight_dict.items():
             layer.register_parameter(
                 weight_name,
-                ModelWeightParameter(data=weights[weight_name].transpose(0, 1),
+                ModelWeightParameter(data=weight_param,
                                      input_dim=1,
                                      output_dim=0,
                                      weight_loader=weight_loader))
-        else:
-            raise ValueError(
-                f"{weight_name} is nor registered. Please check your linear quant method implementation."
-            )
 
-        pertensor_names = self.quant_method.get_pertensor_param()
-        for pertensor_name in pertensor_names:
-            if pertensor_name in weights.keys():
-                param = BasevLLMParameter(data=weights[pertensor_name],
-                                          weight_loader=weight_loader)
-                # disable warning
-                param.ignore_warning = True
-                layer.register_parameter(pertensor_name, param)
-            else:
-                raise ValueError(
-                    f"{pertensor_name} is nor registered. Please check your linear quant method implementation."
-                )
+        pertensor_dict = self.quant_method.get_pertensor_param(params_dtype)
+        for pertensor_name, pertensor_param in pertensor_dict.items():
+            param = PerTensorScaleParameter(data=pertensor_param,
+                                            weight_loader=weight_loader)
+            # disable warning
+            param.ignore_warning = True
+            layer.register_parameter(pertensor_name, param)
 
-        perchannel_names = self.quant_method.get_perchannel_param()
-        for perchannel_name in perchannel_names:
-            if perchannel_name in weights.keys():
-                layer.register_parameter(
-                    perchannel_name,
-                    ChannelQuantScaleParameter(data=weights[perchannel_name],
-                                               output_dim=0,
-                                               weight_loader=weight_loader))
-            else:
-                raise ValueError(
-                    f"{perchannel_name} is nor registered. Please check your linear quant method implementation."
-                )
+        perchannel_dict = self.quant_method.get_perchannel_param(
+            output_size_per_partition, params_dtype)
+        for perchannel_name, perchannel_param in perchannel_dict.items():
+            layer.register_parameter(
+                perchannel_name,
+                ChannelQuantScaleParameter(data=perchannel_param,
+                                           output_dim=0,
+                                           weight_loader=weight_loader))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if hasattr(self.quant_method,
-                   'transpose_weight') and self.quant_method.transpose_weight:
-            layer.weight.data = layer.weight.data.transpose(1, 0)
+        if hasattr(self.quant_method, "process_weights_after_loading"):
+            self.quant_method.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -210,36 +207,26 @@ class AscendLinearMethod(LinearMethodBase):
         return self.quant_method.apply(layer, x, bias)
 
 
-class AscendQKVQuantAttentionMethod(BaseKVCacheMethod):
-    """Linear method for Ascend quantization.
+class AscendKVCacheMethod(BaseKVCacheMethod):
+    """KVCache method for Ascend quantization.
+
+    This class calls AscendQuantizer to search a specific quantization
+    implementations supported on ascend hardware for kvcache methods.
 
     Args:
         quant_config: The Ascend quantization config.
     """
 
-    def __init__(self, quant_config: AscendQuantConfig) -> None:
+    def __init__(self, quant_config: AscendQuantConfig, prefix: str) -> None:
         self.quantizer = AscendQuantizer.get_quantizer(
-            quant_config.quant_description)
+            quant_config.quant_description, prefix)
         self.quant_method = self.quantizer.build_attention_method()
 
     def create_weights(self, layer: torch.nn.Module) -> None:
-        # ascend attention quantization might include some extra weights
-        # and must be loaded by dummy modules
-        extra_module_names = self.quant_method.get_extra_module_names()
-        for name in extra_module_names:
-            setattr(layer, name, torch.nn.Module())
-
-        # During model initialization, the default dtype is set as the model
-        # weight and activation dtype.
-        dtype = torch.get_default_dtype()
-        weights = self.quant_method.create_weights(dtype, layer.num_heads,
-                                                   layer.num_kv_heads)
-
-        for name, weight in weights.items():
-            module_name, weight_name = name.split('.')
-            module = getattr(layer, module_name)
-            module.register_parameter(
-                weight_name, torch.nn.Parameter(weight, requires_grad=False))
+        # Different from linear method, there are no weight processing/slicing
+        # steps for attention in vllm. So the whole process of create weights
+        # is hidden into the specific quant method.
+        self.quant_method.create_weights(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):
@@ -254,3 +241,63 @@ class AscendQKVQuantAttentionMethod(BaseKVCacheMethod):
                                        scale, seq_lens_tensor_cpu,
                                        block_tables, isPrefill, attn_metadata,
                                        output)
+
+
+class AscendFusedMoEMethod(FusedMoEMethodBase):
+    """FusedMoE method for Ascend quantization.
+
+    This class calls AscendQuantizer to search a specific quantization
+    implementations supported on ascend hardware for kvcache methods.
+
+    Args:
+        quant_config: The Ascend quantization config.
+    """
+
+    def __init__(self, quant_config, prefix):
+        self.quantizer = AscendQuantizer.get_quantizer(
+            quant_config.quant_description, prefix)
+        self.quant_method = self.quantizer.build_moe_method()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        weight_param = self.quant_method.get_weight(
+            num_experts, intermediate_size_per_partition, hidden_size,
+            params_dtype)
+        for param_key, param_value in weight_param.items():
+            param = torch.nn.Parameter(param_value, requires_grad=False)
+            layer.register_parameter(param_key, param)
+            set_weight_attrs(param, extra_weight_attrs)
+
+        dynamic_quant_param = self.quant_method.get_dynamic_quant_param(
+            num_experts, intermediate_size_per_partition, hidden_size,
+            params_dtype)
+        for param_key, param_value in dynamic_quant_param.items():
+            param = torch.nn.Parameter(param_value, requires_grad=False)
+            layer.register_parameter(param_key, param)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        return self.quant_method.apply(layer, x, use_grouped_topk, top_k,
+                                       router_logits, renormalize, topk_group,
+                                       num_expert_group,
+                                       custom_routing_function, scoring_func,
+                                       e_score_correction_bias)
