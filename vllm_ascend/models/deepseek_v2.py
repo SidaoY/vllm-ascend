@@ -453,14 +453,3 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
 
 class CustomDeepseekV3ForCausalLM(CustomDeepseekV2ForCausalLM):
     pass
-
-def get_spec_layer_idx_from_weight_name(config: PretrainedConfig,
-                                        weight_name: str) -> Optional[int]:
-    if hasattr(config,
-               "num_nextn_predict_layers") and (config.num_nextn_predict_layers
-                                                > 0):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(f"model.layers.{layer_idx+i}."):
-                return layer_idx + i
-    return None

@@ -36,12 +36,9 @@ from vllm.model_executor.models.deepseek_mtp import (SharedHead,
                                                      DeepSeekMultiTokenPredictorLayer,
                                                      DeepSeekMultiTokenPredictor,
                                                      DeepSeekMTP)
-from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 
-from .deepseek_v2 import (CustomDeepseekV2DecoderLayer,
-                          get_spec_layer_idx_from_weight_name)
-
+from .deepseek_v2 import CustomDeepseekV2DecoderLayer
 
 
 class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
