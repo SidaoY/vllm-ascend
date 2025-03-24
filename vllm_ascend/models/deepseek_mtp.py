@@ -158,7 +158,7 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
 class CustomDeepSeekMTP(DeepSeekMTP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        nn.Module.__init__()
+        nn.Module.__init__(self)
         self.config = vllm_config.model_config.hf_config
         self.model = CustomDeepSeekMultiTokenPredictor(vllm_config=vllm_config,
                                                  prefix=maybe_prefix(
