@@ -48,8 +48,8 @@ def fused_experts(
         hidden_states: Hidden states after routing.
     """
     # Check constraints.
-    if torch.distributed.get_rank() == 0:
-        print(w1.shape)
+    # if torch.distributed.get_rank() == 0:
+    #     print(w1.shape)
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -158,7 +158,7 @@ def fused_experts(
                                        weighted_down_out)
         # TODO: This should not happen! Look into it!
         # fill nan with 0.0
-        final_hidden_states[torch.isnan(final_hidden_states)] = 0.0
+        # final_hidden_states[torch.isnan(final_hidden_states)] = 0.0
     else:
         # TODO: Reorder device memory 2 times here, replace the current
         # implementation here when suitable operators become available.
