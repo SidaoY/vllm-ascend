@@ -20,7 +20,7 @@ from typing import Callable, Optional
 import torch
 import torch_npu
 from vllm.model_executor.layers.fused_moe.layer import \
-    UnquantizedFusedMoEMethod
+    UnquantizedFusedMoEMethod, FusedMoE
 
 
 def fused_experts(
@@ -48,8 +48,8 @@ def fused_experts(
         hidden_states: Hidden states after routing.
     """
     # Check constraints.
-    # if torch.distributed.get_rank() == 0:
-    #     print(w1.shape)
+    if torch.distributed.get_rank() == 0:
+        print(w1.shape)
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -158,7 +158,7 @@ def fused_experts(
                                        weighted_down_out)
         # TODO: This should not happen! Look into it!
         # fill nan with 0.0
-        # final_hidden_states[torch.isnan(final_hidden_states)] = 0.0
+        final_hidden_states[torch.isnan(final_hidden_states)] = 0.0
     else:
         # TODO: Reorder device memory 2 times here, replace the current
         # implementation here when suitable operators become available.
@@ -328,5 +328,37 @@ def forward_oot(
                          top_k=top_k,
                          expert_map=expert_map)
 
+def forward(self, hidden_states: torch.Tensor,
+                router_logits: torch.Tensor, top_k=None):
+    assert self.quant_method is not None
+
+    if top_k:
+        real_top_k = top_k
+    else:
+        real_top_k = self.top_k
+
+    # Matrix multiply.
+    final_hidden_states = self.quant_method.apply(
+        layer=self,
+        x=hidden_states,
+        router_logits=router_logits,
+        top_k=real_top_k,
+        renormalize=self.renormalize,
+        use_grouped_topk=self.use_grouped_topk,
+        global_num_experts=self.num_experts,
+        expert_map=self.expert_map,
+        topk_group=self.topk_group,
+        num_expert_group=self.num_expert_group,
+        custom_routing_function=self.custom_routing_function,
+        scoring_func=self.scoring_func,
+        e_score_correction_bias=self.e_score_correction_bias)
+
+    if self.reduce_results and self.tp_size > 1:
+        final_hidden_states = tensor_model_parallel_all_reduce(
+            final_hidden_states)
+
+    return final_hidden_states
+
 
 UnquantizedFusedMoEMethod.forward_oot = forward_oot
+FusedMoE.forward = forward

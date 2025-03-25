@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.model_runner import (
         ModelInputForNPUBuilder, ModelInputForNPUWithSamplingMetadata)
 
+
 # COUNT = 0
 
 
@@ -103,11 +104,11 @@ class AttentionMaskBuilder:
         return self.attn_mask_cache[:max_seq_len, :max_seq_len].contiguous()
 
     def get_decode_attn_mask(
-        self,
-        input_lengths: torch.tensor,
-        max_s: int,
-        dtype: torch.dtype,
-        device: torch.device,
+            self,
+            input_lengths: torch.tensor,
+            max_s: int,
+            dtype: torch.dtype,
+            device: torch.device,
     ):
         self.update_attn_cache(max_s, dtype, device)
         return (self.attn_mask_cache.index_select(
@@ -134,18 +135,18 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
     ) -> Tuple[int, ...]:
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def swap_blocks(
-        src_kv_cache: List[torch.Tensor],
-        dst_kv_cache: List[torch.Tensor],
-        src_to_dst: torch.Tensor,
+            src_kv_cache: List[torch.Tensor],
+            dst_kv_cache: List[torch.Tensor],
+            src_to_dst: torch.Tensor,
     ) -> None:
         src_key_cache, src_value_cache = src_kv_cache[0], src_kv_cache[1]
         dst_key_cache, dst_value_cache = dst_kv_cache[0], dst_kv_cache[1]
@@ -159,8 +160,8 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
-        src_to_dists: torch.Tensor,
+            kv_caches: List[torch.Tensor],
+            src_to_dists: torch.Tensor,
     ) -> None:
         src_indices = src_to_dists[:, 0]
         dst_indices = src_to_dists[:, 1]
@@ -188,10 +189,10 @@ class AscendMLAAttentionBackend(AscendAttentionBackend):
 
     @staticmethod
     def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
     ) -> Tuple[int, ...]:
         return (num_blocks, block_size, num_kv_heads, head_size)
 
@@ -444,22 +445,22 @@ class AscendMetadata(AttentionMetadata):
         assert self.num_prefills == 0
         assert self.num_prefill_tokens == 0
         assert self.num_decode_tokens == num_seqs
-        assert self.slot_mapping.shape == (num_seqs, )
+        assert self.slot_mapping.shape == (num_seqs,)
 
         assert self.seq_lens is not None
         assert len(self.seq_lens) == num_seqs
         assert self.seq_lens_tensor is not None
-        assert self.seq_lens_tensor.shape == (num_seqs, )
+        assert self.seq_lens_tensor.shape == (num_seqs,)
         assert self.max_query_len == 1
         assert self.max_prefill_seq_len == 0
 
         assert self.query_start_loc is not None
-        assert self.query_start_loc.shape == (num_queries + 1, )
+        assert self.query_start_loc.shape == (num_queries + 1,)
         assert self.seq_start_loc is not None
-        assert self.seq_start_loc.shape == (num_seqs + 1, )
+        assert self.seq_start_loc.shape == (num_seqs + 1,)
 
         assert self.context_lens_tensor is not None
-        assert self.context_lens_tensor.shape == (num_queries, )
+        assert self.context_lens_tensor.shape == (num_queries,)
 
         assert self.block_tables is not None
         assert self.block_tables.shape[0] == num_seqs
@@ -475,7 +476,7 @@ class AscendMetadata(AttentionMetadata):
         # update input_tokens
         sampled_token_ids_list = sampled_token_ids[:
                                                    num_queries].squeeze(  # type: ignore
-                                                       -1)
+            -1)
         model_input.input_tokens[:
                                  num_queries] = sampled_token_ids_list  # type: ignore
 
@@ -502,7 +503,6 @@ class AscendMetadata(AttentionMetadata):
 
 
 class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
-
     _attn_mask_builder = None  # noqa
 
     def __init__(self, input_builder: "ModelInputForNPUBuilder"):
@@ -531,10 +531,10 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
 
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
              curr_sliding_window_block) in zip(
-                 inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
-                 inter_data.orig_seq_lens, inter_data.seq_lens,
-                 inter_data.query_lens, inter_data.context_lens,
-                 inter_data.curr_sliding_window_blocks):
+            inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
+            inter_data.orig_seq_lens, inter_data.seq_lens,
+            inter_data.query_lens, inter_data.context_lens,
+            inter_data.curr_sliding_window_blocks):
             self.context_lens.append(context_len)
             if is_prompt:
                 self.num_prefills += 1
@@ -567,7 +567,7 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
                     block_table = block_tables[seq_id]
                 else:
                     block_table = block_tables[seq_id][
-                        -curr_sliding_window_block:]
+                                  -curr_sliding_window_block:]
             self.block_tables.append(block_table)
 
             # Compute slot mapping.
@@ -587,15 +587,15 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
             )
 
     def _get_graph_runner_block_tables(
-        self, num_seqs: int,
-        block_tables: List[List[int]]) -> torch.Tensor:
+            self, num_seqs: int,
+            block_tables: List[List[int]]) -> torch.Tensor:
         # The shape of graph_block_tables is
         # [max batch size, max context len // block size].
-        
+
         max_batch_size, max_blocks = self.runner.graph_block_tables.shape
         assert max_batch_size >= num_seqs
 
-        graph_block_tables = self.runner.graph_block_tables # [:num_seqs]
+        graph_block_tables = self.runner.graph_block_tables  # [:num_seqs]
         for i, block_table in enumerate(block_tables):
             if block_table:
                 num_blocks = len(block_table)
@@ -603,16 +603,16 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
                     graph_block_tables[i, :num_blocks] = block_table
                 else:
                     graph_block_tables[
-                        i, :max_blocks] = block_table[:max_blocks]
+                    i, :max_blocks] = block_table[:max_blocks]
 
         return torch.from_numpy(graph_block_tables).to(
             device=self.runner.device, non_blocking=True)
-    
+
     def build(
-        self,
-        seq_lens: List[int],
-        query_lens: List[int],
-        graph_pad_size: int,
+            self,
+            seq_lens: List[int],
+            query_lens: List[int],
+            graph_pad_size: int,
     ):
         """Build attention metadata with on-device tensors.
 
@@ -731,17 +731,17 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
 class AscendAttentionBackendImpl(AttentionImpl):
 
     def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int,
-        alibi_slopes: Optional[List[float]],
-        sliding_window: Optional[int],
-        kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
-        logits_soft_cap: Optional[float] = None,
-        attn_type: str = AttentionType.DECODER,
+            self,
+            num_heads: int,
+            head_size: int,
+            scale: float,
+            num_kv_heads: int,
+            alibi_slopes: Optional[List[float]],
+            sliding_window: Optional[int],
+            kv_cache_dtype: str,
+            blocksparse_params: Optional[Dict[str, Any]] = None,
+            logits_soft_cap: Optional[float] = None,
+            attn_type: str = AttentionType.DECODER,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -767,15 +767,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.output: torch.Tensor = None
 
     def forward(
-        self,
-        layer: AttentionLayer,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AscendMetadata,
-        attn_type: str = AttentionType.DECODER,
-        output: Optional[torch.Tensor] = None,
+            self,
+            layer: AttentionLayer,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            kv_cache: torch.Tensor,
+            attn_metadata: AscendMetadata,
+            attn_type: str = AttentionType.DECODER,
+            output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with Ascend attention.
         Args:
@@ -878,7 +878,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 dropout_p=0.0,
                                 is_causal=causal_attn and mask is None,
                                 scale=self.scale).squeeze(0).movedim(
-                                    query.dim() - 2, 0)
+                                query.dim() - 2, 0)
                             self.output[start_q:end_q, :, :] = sub_out
                             start_q, start_kv = end_q, end_kv
                     else:
@@ -904,11 +904,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     self.seq_lens_tensor_cpu = torch.from_numpy(
                         np.array(
                             attn_metadata.prefill_metadata.seq_lens).astype(
-                                np.int32))
+                            np.int32))
                     self.query_lens_tensor_cpu = torch.from_numpy(
                         np.array(
                             attn_metadata.prefill_metadata.query_lens).astype(
-                                np.int32))
+                            np.int32))
                     block_tables = attn_metadata.prefill_metadata.block_tables
                     assert attn_metadata.compress_mask is not None
                     compress_mask = attn_metadata.compress_mask
@@ -967,13 +967,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         return self.output.view(num_tokens, self.hidden_size)
 
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
-def golden_func(kv, 
+
+def golden_func(kv,
                 gamma,
                 cos,
                 sin,
@@ -1013,21 +1015,22 @@ def golden_func(kv,
 
     return k_cache, ckv_cache
 
+
 class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
 
     def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int,
-        alibi_slopes: Optional[List[float]],
-        sliding_window: Optional[int],
-        kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
-        logits_soft_cap: Optional[float] = None,
-        attn_type: str = AttentionType.DECODER,
-        **extra_impl_args,
+            self,
+            num_heads: int,
+            head_size: int,
+            scale: float,
+            num_kv_heads: int,
+            alibi_slopes: Optional[List[float]],
+            sliding_window: Optional[int],
+            kv_cache_dtype: str,
+            blocksparse_params: Optional[Dict[str, Any]] = None,
+            logits_soft_cap: Optional[float] = None,
+            attn_type: str = AttentionType.DECODER,
+            **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -1067,12 +1070,12 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         self.w_vc = None
 
     def exec_kv(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache: Tuple,
-        slots: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            kv_cache: Tuple,
+            slots: torch.Tensor,
     ):
         B = hidden_states.shape[0]
         N = self.num_kv_heads
@@ -1081,13 +1084,12 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv = kv.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
 
-        index = slots[:B].to(torch.int64)
-        k_pe, k_nope = golden_func(
+        k_pe, k_nope = torch.ops.npu_inference.npu_kv_rmsnorm_rope_cache(
             kv,
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            index,
+            slots.to(torch.int64),
             kv_cache[1],
             kv_cache[0],
             epsilon=self.kv_a_layernorm.variance_epsilon,
@@ -1097,11 +1099,11 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         return k_pe, k_nope
 
     def apply_rotary_emb(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        is_neox_style: bool,
+            self,
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            is_neox_style: bool,
     ) -> torch.Tensor:
         """
         Args:
@@ -1126,10 +1128,10 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
             return torch.stack((o1, o2), dim=-1).flatten(-2)
 
     def rope_single(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
     ) -> torch.Tensor:
         B, N, D = x.shape
         S = 1
@@ -1137,16 +1139,27 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         x = torch.ops.npu_inference.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        if self.w_kc is None or self.w_vc is None:
+            kv_b_proj_weight = self.kv_b_proj.weight.reshape(
+                self.num_heads, self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank)
+            self.w_kc = kv_b_proj_weight[:, :self.
+            qk_nope_head_dim, :].contiguous()
+            self.w_vc = kv_b_proj_weight[:,
+                        self.qk_nope_head_dim:, :].transpose(
+                1, 2).contiguous()
+
     def forward(
-        self,
-        layer: AttentionLayer,
-        hidden_states_or_q_c: torch.Tensor,
-        hidden_states_or_kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AscendMetadata,
-        attn_type: str = AttentionType.DECODER,
-        output: Optional[torch.Tensor] = None,
+            self,
+            layer: AttentionLayer,
+            hidden_states_or_q_c: torch.Tensor,
+            hidden_states_or_kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            kv_cache: torch.Tensor,
+            attn_metadata: AscendMetadata,
+            attn_type: str = AttentionType.DECODER,
+            output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with Ascend attention.
         Args:
@@ -1190,7 +1203,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
             if k_pe is None:
                 kv_c, k_pe = self.kv_a_proj_with_mqa(
                     hidden_states_or_kv_c_normed)[0].split(
-                        [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
             else:
                 kv_c_normed = hidden_states_or_kv_c_normed
@@ -1206,16 +1219,6 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
             else:
                 q_pe, k_pe = self.rotary_emb(attn_metadata.input_positions,
                                              q_pe, k_pe)
-
-        if self.w_kc is None or self.w_vc is None:
-            kv_b_proj_weight = self.kv_b_proj.weight.reshape(
-                self.num_heads, self.qk_nope_head_dim + self.v_head_dim,
-                self.kv_lora_rank)
-            self.w_kc = kv_b_proj_weight[:, :self.
-                                         qk_nope_head_dim, :].contiguous()
-            self.w_vc = kv_b_proj_weight[:,
-                                         self.qk_nope_head_dim:, :].transpose(
-                                             1, 2).contiguous()
 
         if attn_metadata.num_prefills > 0:
             kv = self.kv_b_proj(kv_c_normed)[0].view(num_tokens,
@@ -1236,16 +1239,16 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 slots = attn_metadata.slot_mapping
                 torch_npu._npu_reshape_and_cache(key=kv_c_normed.view(
                     num_tokens, self.num_kv_heads, -1),
-                                                 value=k_pe,
-                                                 key_cache=kv_cache[0],
-                                                 value_cache=kv_cache[1],
-                                                 slot_indices=slots)
+                    value=k_pe,
+                    key_cache=kv_cache[0],
+                    value_cache=kv_cache[1],
+                    slot_indices=slots)
         else:
             if kv_cache.numel() > 0:
                 key = torch.cat([
                     kv_c_normed.view(num_tokens, self.num_kv_heads, -1), k_pe
                 ],
-                                dim=2)
+                    dim=2)
                 slots = attn_metadata.slot_mapping
                 torch_npu._npu_reshape_and_cache_siso(key=key,
                                                       key_cache=kv_cache,
@@ -1292,10 +1295,10 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q_nope,
-                    kv_cache[0],
-                    kv_cache[0],
+                    k_nope,
+                    k_nope,
                     query_rope=q_pe,
-                    key_rope=kv_cache[1],
+                    key_rope=k_pe,
                     num_heads=self.num_heads,
                     num_key_value_heads=1,
                     input_layout="BNSD",
@@ -1309,7 +1312,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 )
                 attn_output = attn_output.view(num_tokens, -1,
                                                self.kv_lora_rank).transpose(
-                                                   0, 1)
+                    0, 1)
                 attn_output = torch.bmm(attn_output, self.w_vc).transpose(0, 1)
             else:
                 # if torch.empty is used here, the preemptive scheduling case of
