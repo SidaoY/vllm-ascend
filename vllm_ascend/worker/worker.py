@@ -470,6 +470,7 @@ class NPUWorker(LocalOrDistributedWorkerBase):
             backend: str = "hccl") -> None:
         """Initialize the distributed environment."""
         set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+
         init_distributed_environment(parallel_config.world_size, rank,
                                      distributed_init_method, local_rank,
                                      backend)
