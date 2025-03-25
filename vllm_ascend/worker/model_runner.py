@@ -1131,14 +1131,6 @@ class NPUModelRunner(NPUModelRunnerBase[ModelInputForNPUWithSamplingMetadata]):
         self.attn_state.begin_forward(model_input)
 
         assert model_input.attn_metadata is not None
-        if self.vllm_config.compilation_config.level == \
-                CompilationLevel.DYNAMO_AS_IS and supports_dynamo():
-            torch._dynamo.mark_static(model_input.input_tokens)
-            torch._dynamo.mark_static(model_input.input_positions)
-            torch._dynamo.mark_static(model_input.attn_metadata.block_tables)
-            torch._dynamo.mark_static(model_input.attn_metadata.slot_mapping)
-            torch._dynamo.mark_static(model_input.attn_metadata.query_start_loc)
-            torch._dynamo.mark_static(model_input.attn_metadata.seq_start_loc)
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
