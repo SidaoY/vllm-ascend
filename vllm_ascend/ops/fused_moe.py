@@ -158,7 +158,7 @@ def fused_experts(
                                        weighted_down_out)
         # TODO: This should not happen! Look into it!
         # fill nan with 0.0
-        # final_hidden_states[torch.isnan(final_hidden_states)] = 0.0
+        final_hidden_states[torch.isnan(final_hidden_states)] = 0.0
     else:
         # TODO: Reorder device memory 2 times here, replace the current
         # implementation here when suitable operators become available.
