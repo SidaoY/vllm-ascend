@@ -133,7 +133,7 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
         inputs_embeds: Optional[torch.Tensor] = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        return self.layers[spec_step_idx](
+        return self.layers_list[spec_step_idx](
             input_ids,
             positions,
             kv_caches[spec_step_idx],
@@ -149,7 +149,7 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
         sampling_metadata: SamplingMetadata,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        mtp_layer = self.layers[spec_step_idx]
+        mtp_layer = self.layers_list[spec_step_idx]
         logits = self.logits_processor(mtp_layer.shared_head.head,
                                        hidden_states, sampling_metadata)
         return logits
