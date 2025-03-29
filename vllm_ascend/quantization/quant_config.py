@@ -173,13 +173,20 @@ class AscendLinearMethod(LinearMethodBase):
         weight_dict = self.quant_method.get_weight(input_size_per_partition,
                                                    output_size_per_partition,
                                                    params_dtype)
+        #for weight_name, weight_param in weight_dict.items():
+        #    layer.register_parameter(
+        #        weight_name,
+        #        ModelWeightParameter(data=weight_param,
+        #                             input_dim=1,
+        #                             output_dim=0,
+        #                             weight_loader=weight_loader))
+        
+        # for graph mode
         for weight_name, weight_param in weight_dict.items():
-            layer.register_parameter(
-                weight_name,
-                ModelWeightParameter(data=weight_param,
-                                     input_dim=1,
-                                     output_dim=0,
-                                     weight_loader=weight_loader))
+            param = torch.nn.Parameter(weight_param, requires_grad=False)
+            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            layer.register_parameter(weight_name, param)
+            set_weight_attrs(param, extra_weight_attrs)
 
         pertensor_dict = self.quant_method.get_pertensor_param(params_dtype)
         for pertensor_name, pertensor_param in pertensor_dict.items():
@@ -191,12 +198,19 @@ class AscendLinearMethod(LinearMethodBase):
 
         perchannel_dict = self.quant_method.get_perchannel_param(
             output_size_per_partition, params_dtype)
+        #for perchannel_name, perchannel_param in perchannel_dict.items():
+        #    layer.register_parameter(
+        #        perchannel_name,
+        #        ChannelQuantScaleParameter(data=perchannel_param,
+        #                                   output_dim=0,
+        #                                   weight_loader=weight_loader))
+
+        # for graph mode
         for perchannel_name, perchannel_param in perchannel_dict.items():
-            layer.register_parameter(
-                perchannel_name,
-                ChannelQuantScaleParameter(data=perchannel_param,
-                                           output_dim=0,
-                                           weight_loader=weight_loader))
+            param = torch.nn.Parameter(perchannel_param, requires_grad=False)
+            set_weight_attrs(param, {"output_dim": 0})
+            layer.register_parameter(perchannel_name, param)
+            set_weight_attrs(param, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):
