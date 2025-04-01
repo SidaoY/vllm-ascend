@@ -126,6 +126,7 @@ class CustomDeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
             )
         CustomDeepseekV2MoE.top_k = config.num_experts_per_tok
 
@@ -466,6 +467,13 @@ class CustomDeepseekV2Model(nn.Module):
 
 
 class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
+    # add `packed_modules_mapping` in `DeepseekV2ForCausalLM` to support weight merging
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "experts":
+        ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"]
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_config
