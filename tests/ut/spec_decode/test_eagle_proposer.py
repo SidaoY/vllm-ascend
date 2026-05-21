@@ -13,6 +13,7 @@ from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 
 import vllm_ascend.spec_decode.eagle_proposer as eagle_proposer
 from tests.ut.base import TestBase
@@ -3659,7 +3660,7 @@ class TestEagleProposerSetInputsFirstPass:
             patch("vllm.multimodal.registry.MultiModalRegistry.supports_multimodal_inputs", return_value=False),
             set_current_vllm_config(vllm_config),
         ):
-            if method == "eagle":
+            if method in ("eagle", "mtp"):
                 proposer = AscendEagleProposer(
                     vllm_config=vllm_config,
                     device=device,
@@ -3751,6 +3752,82 @@ class TestEagleProposerSetInputsFirstPass:
         ]
         for attr in attrs_from_proposer:
             assert_attr_equal(attr, expected_proposer, proposer)
+
+    def test_set_inputs_first_pass_mtp_masks_rejected_tail(self):
+        """
+        Regression for padded MTP batches where a middle request has rejected
+        draft tokens and is followed by another request.
+        """
+        num_speculative_tokens = 3
+        block_size = BLOCK_SIZE
+
+        proposer, vllm_config = self._create_proposer(
+            method="mtp",
+            num_speculative_tokens=num_speculative_tokens,
+            device=self.device,
+            runner=self.runner,
+        )
+
+        batch_spec = BatchSpec(
+            seq_lens=[10, 10, 10],
+            query_lens=[4, 4, 4],
+        )
+        common_attn_metadata = create_common_attn_metadata(
+            batch_spec,
+            block_size=block_size,
+            device=self.device,
+            arange_block_indices=True,
+        )
+        old_slot_mapping = common_attn_metadata.slot_mapping.clone()
+
+        target_token_ids = torch.tensor(
+            [10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        target_positions = torch.arange(12, dtype=torch.int64, device=self.device)
+        target_hidden_states = (
+            torch.arange(12 * proposer.hidden_size, dtype=proposer.dtype, device=self.device)
+            .view(12, proposer.hidden_size)
+        )
+        next_token_ids = torch.tensor([100, 200, 300], dtype=torch.int32, device=self.device)
+        token_indices_to_sample = torch.tensor([3, 5, 11], dtype=torch.int32, device=self.device)
+        num_rejected_tokens_gpu = torch.tensor([0, 2, 0], dtype=torch.int32, device=self.device)
+
+        out_num_tokens, out_token_indices, out_cad, long_seq_args = proposer.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=common_attn_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+
+        assert out_num_tokens == 12
+        assert torch.equal(out_token_indices, token_indices_to_sample)
+        assert long_seq_args == (None, None)
+
+        expected_input_ids = torch.tensor(
+            [11, 12, 13, 100, 21, 200, 0, 0, 31, 32, 33, 300],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        assert torch.equal(proposer.input_ids[:out_num_tokens], expected_input_ids)
+        assert not torch.any(proposer.input_ids[6:8] == 30)
+
+        expected_positions = target_positions.clone()
+        expected_positions[6:8] = 0
+        assert torch.equal(proposer.positions[:out_num_tokens], expected_positions.to(torch.int32))
+        assert torch.equal(out_cad.positions, expected_positions)
+
+        expected_hidden_states = target_hidden_states.clone()
+        expected_hidden_states[6:8] = 0
+        assert torch.equal(proposer.hidden_states[:out_num_tokens], expected_hidden_states)
+
+        expected_slot_mapping = old_slot_mapping
+        expected_slot_mapping[6:8] = PADDING_SLOT_ID
+        assert torch.equal(out_cad.slot_mapping[:out_num_tokens], expected_slot_mapping)
 
     def test_set_inputs_first_pass_pcp_dcp_mixed(self):
         """

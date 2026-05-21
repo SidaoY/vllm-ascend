@@ -733,6 +733,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+        if (
+            self.method == "mtp"
+            and self.use_compress
+            and self.num_speculative_tokens > 1
+            and num_rejected_tokens_gpu is not None
+            and self.pcp_size * self.dcp_size == 1
+        ):
+            # Keep the first MTP pass in the padded target layout, but make
+            # recurrent draft steps use the post-rejection sequence lengths.
+            common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+            common_attn_metadata.seq_lens[:batch_size] -= num_rejected_tokens_gpu[:batch_size]
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -1126,6 +1138,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Replace the last token with the next token.
             # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
             self.input_ids[token_indices_to_sample] = next_token_ids
+            rejected_token_mask = None
+            if num_rejected_tokens_gpu is not None and self.pcp_size == 1:
+                query_start_loc = cad.query_start_loc
+                query_lens = query_start_loc[1:] - query_start_loc[:-1]
+                req_indices = torch.repeat_interleave(
+                    self.arange[: query_lens.shape[0]].to(torch.long),
+                    query_lens.to(torch.long),
+                    output_size=num_tokens,
+                )
+                valid_query_end = query_start_loc[1:] - 1 - num_rejected_tokens_gpu
+                rejected_token_mask = self.arange[:num_tokens] > valid_query_end[req_indices]
+                self.input_ids[:num_tokens].masked_fill_(rejected_token_mask, 0)
+                slot_mapping_mask = rejected_token_mask
+                while slot_mapping_mask.dim() < cad.slot_mapping.dim():
+                    slot_mapping_mask = slot_mapping_mask.unsqueeze(-1)
+                cad.slot_mapping = cad.slot_mapping.clone()
+                cad.slot_mapping[:num_tokens].masked_fill_(slot_mapping_mask, PADDING_SLOT_ID)
 
             assert self.runner is not None
             # update pcp related params
@@ -1199,8 +1228,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
                 target_positions = target_positions[0]
 
+            if rejected_token_mask is not None:
+                if target_positions.dim() == 1:
+                    target_positions = target_positions.masked_fill(rejected_token_mask, 0)
+                else:
+                    target_positions = target_positions.masked_fill(rejected_token_mask.unsqueeze(0), 0)
+                cad.positions = target_positions
+
             self._set_positions(num_tokens, target_positions)
             self.hidden_states[:num_tokens] = target_hidden_states.view(num_tokens, -1)
+            if rejected_token_mask is not None:
+                self.hidden_states[:num_tokens].masked_fill_(rejected_token_mask.unsqueeze(-1), 0)
 
             return num_tokens, token_indices_to_sample, cad, (query_lens_d, ori_token_indices_to_sample)
         else:
