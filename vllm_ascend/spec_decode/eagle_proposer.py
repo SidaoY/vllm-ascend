@@ -384,6 +384,89 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 decode_metadata.sas_metadata = decode_metadata.sas_metadata.clone()
         return attn_metadata
 
+    def _maybe_adjust_mtp_metadata_after_rejection(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        batch_size: int,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        num_rejected_tokens_cpu: torch.Tensor | None = None,
+    ) -> CommonAttentionMetadata:
+        if not (
+            self.method == "mtp"
+            and self.use_compress
+            and self.num_speculative_tokens > 1
+            and num_rejected_tokens_gpu is not None
+            and self.pcp_size * self.dcp_size == 1
+        ):
+            return common_attn_metadata
+
+        # Padded MTP batches keep rejected target tokens in the flattened
+        # layout, but the draft model must attend from the accepted boundary.
+        common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+        rejected_tokens = num_rejected_tokens_gpu[:batch_size]
+        common_attn_metadata.seq_lens[:batch_size] -= rejected_tokens
+
+        def adjust_cpu_seq_lens(cpu_seq_lens: torch.Tensor | None) -> torch.Tensor | None:
+            if not torch.is_tensor(cpu_seq_lens):
+                return None
+            if num_rejected_tokens_cpu is None:
+                # Do not keep stale optimistic CPU mirrors. DSA builders prefer
+                # _seq_lens_cpu/seq_lens_cpu for max seq len metadata; clearing
+                # them makes the builder fall back to the adjusted device tensor.
+                return None
+            adjusted = cpu_seq_lens.clone()
+            adjusted[:batch_size] -= num_rejected_tokens_cpu[:batch_size].to(dtype=adjusted.dtype)
+            return adjusted
+
+        if num_rejected_tokens_cpu is None and rejected_tokens.device.type == "cpu":
+            num_rejected_tokens_cpu = rejected_tokens
+
+        common_attn_metadata.seq_lens_cpu = adjust_cpu_seq_lens(common_attn_metadata.seq_lens_cpu)
+        common_attn_metadata._seq_lens_cpu = adjust_cpu_seq_lens(common_attn_metadata._seq_lens_cpu)
+        common_attn_metadata.seq_lens_cpu_upper_bound = adjust_cpu_seq_lens(
+            common_attn_metadata.seq_lens_cpu_upper_bound
+        )
+        common_attn_metadata.num_computed_tokens_cpu = adjust_cpu_seq_lens(
+            common_attn_metadata.num_computed_tokens_cpu
+        )
+        common_attn_metadata._num_computed_tokens_cpu = adjust_cpu_seq_lens(
+            common_attn_metadata._num_computed_tokens_cpu
+        )
+        common_attn_metadata._num_computed_tokens_cache = None
+        return common_attn_metadata
+
+    def _get_mtp_rejected_tokens_cpu(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        valid_sampled_tokens_count: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor | None:
+        if not (
+            self.method == "mtp"
+            and self.use_compress
+            and self.num_speculative_tokens > 1
+            and self.pcp_size * self.dcp_size == 1
+        ):
+            return None
+
+        if valid_sampled_tokens_count.device.type == "cpu":
+            valid_sampled_tokens_count_cpu = valid_sampled_tokens_count[:num_reqs].to(dtype=torch.int32)
+        else:
+            sampled_count_event = getattr(self.runner, "valid_sampled_token_count_event", None)
+            sampled_count_cpu = getattr(self.runner, "valid_sampled_token_count_cpu", None)
+            if sampled_count_event is None or not torch.is_tensor(sampled_count_cpu):
+                return None
+            sampled_count_event.synchronize()
+            valid_sampled_tokens_count_cpu = sampled_count_cpu[:num_reqs].clone().to(dtype=torch.int32)
+
+        num_draft_tokens = torch.tensor(spec_decode_metadata.num_draft_tokens[:num_reqs], dtype=torch.int32)
+        return torch.where(
+            num_draft_tokens > 0,
+            num_draft_tokens + 1 - valid_sampled_tokens_count_cpu,
+            torch.zeros_like(num_draft_tokens),
+        )
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -676,6 +759,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     common_attn_metadata.block_table_tensor, num_reqs_padded
                 )
 
+        common_attn_metadata = self._maybe_adjust_mtp_metadata_after_rejection(
+            common_attn_metadata,
+            batch_size,
+            num_rejected_tokens_gpu,
+            getattr(common_attn_metadata, "_mtp_num_rejected_tokens_cpu", None),
+        )
+
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
             inputs_embeds = self.model.embed_input_ids(
@@ -733,18 +823,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
-        if (
-            self.method == "mtp"
-            and self.use_compress
-            and self.num_speculative_tokens > 1
-            and num_rejected_tokens_gpu is not None
-            and self.pcp_size * self.dcp_size == 1
-        ):
-            # Keep the first MTP pass in the padded target layout, but make
-            # recurrent draft steps use the post-rejection sequence lengths.
-            common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
-            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
-            common_attn_metadata.seq_lens[:batch_size] -= num_rejected_tokens_gpu[:batch_size]
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -1233,7 +1311,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     target_positions = target_positions.masked_fill(rejected_token_mask, 0)
                 else:
                     target_positions = target_positions.masked_fill(rejected_token_mask.unsqueeze(0), 0)
-                cad.positions = target_positions
+                if cad.positions is not None:
+                    cad.positions = cad.positions.clone()
+                    if cad.positions.dim() == 1:
+                        cad.positions[:num_tokens] = target_positions
+                    else:
+                        cad.positions[:, :num_tokens] = target_positions
+                positions_cpu = getattr(cad, "positions_cpu", None)
+                if positions_cpu is not None:
+                    cad.positions_cpu = positions_cpu.clone()
+                    target_positions_cpu = target_positions.to("cpu")
+                    if cad.positions_cpu.dim() == 1:
+                        cad.positions_cpu[:num_tokens] = target_positions_cpu
+                    else:
+                        cad.positions_cpu[:, :num_tokens] = target_positions_cpu
 
             self._set_positions(num_tokens, target_positions)
             self.hidden_states[:num_tokens] = target_hidden_states.view(num_tokens, -1)
@@ -1779,6 +1870,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         total_num_tokens = query_start_loc_cpu[-1].item()
         token_indices = self.arange[:total_num_tokens]
+        num_rejected_tokens_cpu = self._get_mtp_rejected_tokens_cpu(
+            spec_decode_metadata,
+            valid_sampled_tokens_count,
+            common_attn_metadata.num_reqs,
+        )
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -1812,6 +1908,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=0,
         )
+        if num_rejected_tokens_cpu is not None:
+            spec_common_attn_metadata._mtp_num_rejected_tokens_cpu = num_rejected_tokens_cpu
 
         return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu
 

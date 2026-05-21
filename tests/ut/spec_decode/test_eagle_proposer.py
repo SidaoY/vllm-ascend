@@ -1402,11 +1402,11 @@ class TestEagleProposerPropose:
                 assert torch.equal(captured_common_attn_metadata.positions, torch.tensor([17, 16, 16, 18, 13, 14, 15, 16, 13, 14, 15, 16, 8, 9, 10, 11, 12, 0, 1,
                                                                                           2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] + [0]*(8704-30), dtype=torch.int64))
             if model_type == 'deepseek':
-                assert torch.equal(captured_common_attn_metadata.seq_lens, torch.tensor([16, 15, 16]))
+                assert torch.equal(captured_common_attn_metadata.seq_lens, torch.tensor([15, 13, 13]))
                 assert torch.equal(captured_common_attn_metadata.slot_mapping, torch.cat([torch.tensor([142, 268, 396]), torch.full((8701,), -1)]))
-                assert torch.equal(captured_common_attn_metadata.seq_lens_cpu, torch.tensor([16, 15, 16]))
-                assert torch.equal(captured_common_attn_metadata.num_computed_tokens_cpu, torch.tensor([12, 11, 12]))
-                assert torch.equal(captured_common_attn_metadata.positions, torch.tensor([14, 12, 12, 13, 9, 10, 11, 12, 10, 11, 12, 13, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9] + [0]*(8704-23), dtype=torch.int64))
+                assert torch.equal(captured_common_attn_metadata.seq_lens_cpu, torch.tensor([15, 13, 13]))
+                assert torch.equal(captured_common_attn_metadata.num_computed_tokens_cpu, torch.tensor([11, 9, 9]))
+                assert torch.equal(captured_common_attn_metadata.positions, torch.tensor([14, 12, 12, 0, 9, 10, 0, 0, 10, 0, 0, 0, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9] + [0]*(8704-23), dtype=torch.int64))
         assert captured_common_attn_metadata.causal
         assert captured_common_attn_metadata.logits_indices_padded is None
         assert captured_common_attn_metadata.num_logits_indices is None
@@ -3778,6 +3778,12 @@ class TestEagleProposerSetInputsFirstPass:
             device=self.device,
             arange_block_indices=True,
         )
+        common_attn_metadata.positions = torch.cat(
+            [
+                common_attn_metadata.positions,
+                torch.full((4,), -1, dtype=torch.int64, device=self.device),
+            ]
+        )
         old_slot_mapping = common_attn_metadata.slot_mapping.clone()
 
         target_token_ids = torch.tensor(
@@ -3819,7 +3825,8 @@ class TestEagleProposerSetInputsFirstPass:
         expected_positions = target_positions.clone()
         expected_positions[6:8] = 0
         assert torch.equal(proposer.positions[:out_num_tokens], expected_positions.to(torch.int32))
-        assert torch.equal(out_cad.positions, expected_positions)
+        assert out_cad.positions.shape == common_attn_metadata.positions.shape
+        assert torch.equal(out_cad.positions[:out_num_tokens], expected_positions)
 
         expected_hidden_states = target_hidden_states.clone()
         expected_hidden_states[6:8] = 0
@@ -3828,6 +3835,98 @@ class TestEagleProposerSetInputsFirstPass:
         expected_slot_mapping = old_slot_mapping
         expected_slot_mapping[6:8] = PADDING_SLOT_ID
         assert torch.equal(out_cad.slot_mapping[:out_num_tokens], expected_slot_mapping)
+
+    def test_adjust_mtp_metadata_after_rejection_updates_cpu_mirrors(self):
+        num_speculative_tokens = 3
+        block_size = BLOCK_SIZE
+
+        proposer, _ = self._create_proposer(
+            method="mtp",
+            num_speculative_tokens=num_speculative_tokens,
+            device=self.device,
+            runner=self.runner,
+        )
+        proposer.use_compress = True
+
+        batch_spec = BatchSpec(
+            seq_lens=[14, 13, 14],
+            query_lens=[4, 4, 4],
+        )
+        common_attn_metadata = create_common_attn_metadata(
+            batch_spec,
+            block_size=block_size,
+            device=self.device,
+        )
+        common_attn_metadata._seq_lens_cpu = torch.tensor([14, 13, 14], dtype=torch.int32)
+        common_attn_metadata.seq_lens_cpu_upper_bound = torch.tensor([14, 13, 14], dtype=torch.int32)
+
+        num_rejected_tokens_gpu = torch.tensor([1, 2, 3], dtype=torch.int32, device=self.device)
+        num_rejected_tokens_cpu = torch.tensor([1, 2, 3], dtype=torch.int32)
+
+        adjusted = proposer._maybe_adjust_mtp_metadata_after_rejection(
+            common_attn_metadata,
+            batch_size=3,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            num_rejected_tokens_cpu=num_rejected_tokens_cpu,
+        )
+
+        expected_seq_lens = torch.tensor([13, 11, 11], dtype=torch.int32, device=self.device)
+        expected_seq_lens_cpu = torch.tensor([13, 11, 11], dtype=torch.int32)
+        assert adjusted is not common_attn_metadata
+        assert torch.equal(adjusted.seq_lens, expected_seq_lens)
+        assert torch.equal(adjusted.seq_lens_cpu, expected_seq_lens_cpu)
+        assert torch.equal(adjusted._seq_lens_cpu, expected_seq_lens_cpu)
+        assert torch.equal(adjusted.seq_lens_cpu_upper_bound, expected_seq_lens_cpu)
+        assert torch.equal(adjusted.num_computed_tokens_cpu, torch.tensor([9, 7, 7], dtype=torch.int32))
+        assert adjusted._num_computed_tokens_cpu is None
+        assert adjusted._num_computed_tokens_cache is None
+        assert torch.equal(common_attn_metadata.seq_lens, torch.tensor([14, 13, 14], dtype=torch.int32, device=self.device))
+        assert torch.equal(common_attn_metadata._seq_lens_cpu, torch.tensor([14, 13, 14], dtype=torch.int32))
+
+    def test_adjust_mtp_metadata_after_rejection_clears_stale_cpu_mirrors(self):
+        num_speculative_tokens = 3
+        block_size = BLOCK_SIZE
+
+        proposer, _ = self._create_proposer(
+            method="mtp",
+            num_speculative_tokens=num_speculative_tokens,
+            device=self.device,
+            runner=self.runner,
+        )
+        proposer.use_compress = True
+
+        batch_spec = BatchSpec(
+            seq_lens=[14, 13, 14],
+            query_lens=[4, 4, 4],
+        )
+        common_attn_metadata = create_common_attn_metadata(
+            batch_spec,
+            block_size=block_size,
+            device=self.device,
+        )
+        common_attn_metadata._seq_lens_cpu = torch.tensor([14, 13, 14], dtype=torch.int32)
+        common_attn_metadata.seq_lens_cpu_upper_bound = torch.tensor([14, 13, 14], dtype=torch.int32)
+
+        num_rejected_tokens_gpu = torch.tensor([1, 2, 3], dtype=torch.int32, device=self.device)
+
+        adjusted = proposer._maybe_adjust_mtp_metadata_after_rejection(
+            common_attn_metadata,
+            batch_size=3,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+
+        expected_seq_lens = torch.tensor([13, 11, 11], dtype=torch.int32, device=self.device)
+        assert torch.equal(adjusted.seq_lens, expected_seq_lens)
+        if num_rejected_tokens_gpu.device.type == "cpu":
+            expected_seq_lens_cpu = torch.tensor([13, 11, 11], dtype=torch.int32)
+            assert torch.equal(adjusted.seq_lens_cpu, expected_seq_lens_cpu)
+            assert torch.equal(adjusted._seq_lens_cpu, expected_seq_lens_cpu)
+            assert torch.equal(adjusted.seq_lens_cpu_upper_bound, expected_seq_lens_cpu)
+        else:
+            assert adjusted.seq_lens_cpu is None
+            assert adjusted._seq_lens_cpu is None
+            assert adjusted.seq_lens_cpu_upper_bound is None
+            assert adjusted.num_computed_tokens_cpu is None
 
     def test_set_inputs_first_pass_pcp_dcp_mixed(self):
         """

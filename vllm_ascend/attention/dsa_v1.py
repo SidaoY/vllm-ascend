@@ -42,8 +42,40 @@ else:
 
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
-
 # mypy: disable-error-code="has-type"
+
+
+def _build_dsa_slot_mapping(slot_mapping: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Convert linear slot ids to DSA [block, offset] indices.
+
+    vLLM marks graph padding and rejected speculative tokens with PAD_SLOT_ID
+    (-1), meaning "do not write KV". The DSA scatter op expects in-range
+    two-dimensional indices, so map padding to the reserved null block and
+    mask the corresponding KV rows before scatter.
+    """
+    valid_slot_mapping = torch.where(slot_mapping < 0, torch.zeros_like(slot_mapping), slot_mapping)
+    return torch.stack(
+        [valid_slot_mapping // block_size, valid_slot_mapping % block_size],
+        axis=-1,
+    )
+
+
+def _build_dsa_slot_mapping_padding_mask(slot_mapping: torch.Tensor) -> torch.Tensor:
+    return slot_mapping < 0
+
+
+def _mask_padding_slot_values_(
+    slot_mapping_padding_mask: torch.Tensor | None,
+    values: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if values is None or values.numel() == 0:
+        return None
+    if slot_mapping_padding_mask is None:
+        return values
+
+    while slot_mapping_padding_mask.dim() < values.dim():
+        slot_mapping_padding_mask = slot_mapping_padding_mask.unsqueeze(-1)
+    return values.masked_fill_(slot_mapping_padding_mask, 0)
 
 
 def hadamard_transform_ref(
@@ -183,6 +215,7 @@ class AscendDSAPrefillMetadata:
     qli_metadata: torch.Tensor = None
     cu_c4_cmp_seqlen_list: torch.Tensor = None
     cu_c128_cmp_seqlen_list: torch.Tensor = None
+    slot_mapping_padding_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -210,6 +243,7 @@ class AscendDSADecodeMetadata:
     start_pos: torch.Tensor = None
     sas_metadata: torch.Tensor = None
     qli_metadata: torch.Tensor = None
+    slot_mapping_padding_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -295,11 +329,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
         self.spec_slot_mapping = None
+        self.spec_slot_mapping_padding_mask = None
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             self.spec_slot_mapping = [
                 torch.zeros(
                     (vllm_config.scheduler_config.max_num_batched_tokens, 2), dtype=torch.int32, device=self.device
+                )
+                for _ in range(spec_token_num)
+            ]
+            self.spec_slot_mapping_padding_mask = [
+                torch.zeros(
+                    (vllm_config.scheduler_config.max_num_batched_tokens,), dtype=torch.bool, device=self.device
                 )
                 for _ in range(spec_token_num)
             ]
@@ -355,6 +396,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # [block_nums, block_size, head_num, head_dim]
         self.slot_mapping = torch.zeros(
             (vllm_config.scheduler_config.max_num_batched_tokens, 2), dtype=torch.int32, device=self.device
+        )
+        self.slot_mapping_padding_mask = torch.zeros(
+            (vllm_config.scheduler_config.max_num_batched_tokens,), dtype=torch.bool, device=self.device
         )
 
     @classmethod
@@ -482,9 +526,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         # NOTE: Currently, MTP-fullgraph is incompatibility pcp
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.slot_mapping[:num_input_tokens] = torch.stack(
-            [slot_mapping // self.block_size, slot_mapping % self.block_size], axis=-1
-        )
+        self.slot_mapping[:num_input_tokens] = _build_dsa_slot_mapping(slot_mapping, self.block_size)
+        self.slot_mapping_padding_mask[:num_input_tokens] = _build_dsa_slot_mapping_padding_mask(slot_mapping)
+        self.slot_mapping_padding_mask[num_input_tokens:].fill_(False)
 
         self.graph_pad_size = common_attn_metadata.graph_pad_size
         block_table_size = self.get_block_table_size(common_attn_metadata, BUILD_METADATA_STEP_PREFILL)
@@ -638,6 +682,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         prefill_slot_mapping = self.slot_mapping[
             compressed_tokens_start : compressed_tokens_end + compressed_tokens_start
         ]
+        prefill_slot_mapping_padding_mask = self.slot_mapping_padding_mask[
+            compressed_tokens_start : compressed_tokens_end + compressed_tokens_start
+        ]
 
         assert self.start_pos_prefill is not None
         self.start_pos_prefill.fill_(0)
@@ -774,6 +821,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata=qli_metadata,
             cu_c4_cmp_seqlen_list=cu_c4_cmp_seqlen_list,
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
+            slot_mapping_padding_mask=prefill_slot_mapping_padding_mask,
         )
 
     def build_decode_metadata(
@@ -883,6 +931,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ]
 
         slot_mapping = self.slot_mapping[:compressed_tokens_start]
+        slot_mapping_padding_mask = self.slot_mapping_padding_mask[:compressed_tokens_start]
 
         assert self.start_pos_decode is not None
         self.start_pos_decode.fill_(0)
@@ -1021,6 +1070,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_decode[: self.num_decodes],  # cached
             sas_metadata=self.decode_sas_metadata,
             qli_metadata=self.decode_qli_metadata,
+            slot_mapping_padding_mask=slot_mapping_padding_mask,
         )
         return decode_metadata
 
@@ -1043,9 +1093,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos, sin = get_cos_and_sin_dsa(input_positions, True)
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.spec_slot_mapping[draft_step - 1][:num_input_tokens] = torch.stack(  # type: ignore[index]
-            [slot_mapping // self.block_size, slot_mapping % self.block_size], axis=-1
+        self.spec_slot_mapping[draft_step - 1][:num_input_tokens] = _build_dsa_slot_mapping(  # type: ignore[index]
+            slot_mapping, self.block_size
         )
+        self.spec_slot_mapping_padding_mask[draft_step - 1][:num_input_tokens] = (  # type: ignore[index]
+            _build_dsa_slot_mapping_padding_mask(slot_mapping)
+        )
+        self.spec_slot_mapping_padding_mask[draft_step - 1][num_input_tokens:].fill_(False)  # type: ignore[index]
         # logger.info(f'{draft_step=} {slot_mapping=} {self.spec_slot_mapping[draft_step - 1]=}')
 
         prefill_metadata = None
@@ -1111,6 +1165,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cos, sin = get_cos_and_sin_dsa(prefill_input_positions)
 
         prefill_slot_mapping = self.spec_slot_mapping[draft_step - 1][tokens_start:num_prefill_tokens]  # type: ignore[index]
+        prefill_slot_mapping_padding_mask = self.spec_slot_mapping_padding_mask[draft_step - 1][  # type: ignore[index]
+            tokens_start:num_prefill_tokens
+        ]
         block_table = common_attn_metadata.block_table_tensor[: common_attn_metadata.num_reqs]
 
         sas_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
@@ -1156,6 +1213,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata=None,
             cu_c4_cmp_seqlen_list=None,
             cu_c128_cmp_seqlen_list=None,
+            slot_mapping_padding_mask=prefill_slot_mapping_padding_mask,
         )
 
     def build_decode_metadata_for_drafting(
@@ -1188,6 +1246,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
 
         slot_mapping = self.spec_slot_mapping[draft_step - 1][:num_decode_tokens_typed]  # type: ignore[index]
+        slot_mapping_padding_mask = self.spec_slot_mapping_padding_mask[draft_step - 1][  # type: ignore[index]
+            :num_decode_tokens_typed
+        ]
         block_table = common_attn_metadata.block_table_tensor
 
         decode_sas_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
@@ -1235,6 +1296,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=None,  # cached
             sas_metadata=decode_sas_metadata,
             qli_metadata=None,
+            slot_mapping_padding_mask=slot_mapping_padding_mask,
         )
         return decode_metadata
 
@@ -1513,6 +1575,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         kv = self.kv_norm(kv)
         assert self.rope_head_dim is not None
         kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
+        _mask_padding_slot_values_(swa_metadata.prefill.slot_mapping_padding_mask, kv)
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             kv.unsqueeze(1),
@@ -1572,6 +1635,8 @@ class AscendDSAImpl(DSAAttentionImpl):
 
             if compressed_kv.numel() == 0:
                 compressed_kv = None
+            else:
+                _mask_padding_slot_values_(compressor_attn_metadata.prefill.slot_mapping_padding_mask, compressed_kv)
 
             # kv_compress_epilog
             torch.ops._C_ascend.npu_scatter_nd_update_v2(
@@ -1716,6 +1781,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             kv = self.kv_norm(kv)
             assert self.rope_head_dim is not None
             kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
+            _mask_padding_slot_values_(swa_metadata.decode.slot_mapping_padding_mask, kv)
 
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 kv.unsqueeze(1),
@@ -1778,6 +1844,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 rotary_mode=2,
                 cache_mode=1,
             )
+            _mask_padding_slot_values_(compressor_attn_metadata.decode.slot_mapping_padding_mask, compressed_kv)
             # kv_compress_epilog
             torch.ops._C_ascend.npu_scatter_nd_update_v2(
                 compress_kv_cache, compressor_attn_metadata.decode.slot_mapping, compressed_kv
@@ -1923,6 +1990,13 @@ class AscendDSAImpl(DSAAttentionImpl):
             kv = None
         elif self.indexer.compressor.rotate:  # type: ignore[union-attr]
             kv = rotate_activation(kv, indexer_kv_scale_metadata.hadamard)
+        if kv is not None:
+            if with_prefill:
+                assert indexer_kv_scale_metadata.prefill is not None
+                _mask_padding_slot_values_(indexer_kv_scale_metadata.prefill.slot_mapping_padding_mask, kv)
+            else:
+                assert indexer_kv_scale_metadata.decode is not None
+                _mask_padding_slot_values_(indexer_kv_scale_metadata.decode.slot_mapping_padding_mask, kv)
 
         weights = self.weights_proj(x) * (self.indexer_softmax_scale * self.indexer_heads**-0.5)
 
@@ -1933,6 +2007,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         if kv is not None:
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv, dst_type=dst_type)
             kv_scale = kv_scale.unsqueeze(-1)
+            if with_prefill:
+                assert indexer_kv_scale_metadata.prefill is not None
+                _mask_padding_slot_values_(indexer_kv_scale_metadata.prefill.slot_mapping_padding_mask, kv_scale)
+            else:
+                assert indexer_kv_scale_metadata.decode is not None
+                _mask_padding_slot_values_(indexer_kv_scale_metadata.decode.slot_mapping_padding_mask, kv_scale)
 
         if soc_version not in {AscendDeviceType.A5}:
             q_scale = q_scale.to(torch.float16)
